@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local experiment artifacts
+oracle_data*/
+experiment_logs/
+*.pth
+*.npz
+*.pt
+*.safetensors
+
+# Local outputs
+*.log
+*.tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
