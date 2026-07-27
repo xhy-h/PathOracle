@@ -1,122 +1,137 @@
-# PathOracle
+# PathOracle CPU MVP
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-CPU%20tested-ee4c2c.svg)](https://pytorch.org/)
+用一个小型"神谕网络"（Oracle）跳过 Transformer 模型的中间层，在推理时减少计算量。
 
-**Skip layers, keep accuracy. PathOracle predicts hidden states to accelerate Transformer prefill with a small external oracle.**
+## 前提
 
-PathOracle is a CPU-tested research framework for prefill-time layer skipping. It runs the early Transformer layers, predicts the hidden state that would have been produced after skipped middle layers, and then resumes the final layers. This is designed to be complementary to speculative decoding systems such as DSpark: PathOracle targets **prefill**, while speculative decoding targets **decode**.
-
-- Verified on `distilgpt2`: **1.66x PPL ratio** with a 2-block Transformer oracle.
-- Verified on GPT-2 Small: **1.92x PPL ratio** while skipping 8 of 12 blocks.
-- Fully parameterized experiment scripts for data collection, oracle training, inference, and evaluation.
-- Designed as a stepping stone toward MoE prefill acceleration, including a DeepSeek-V4 migration plan.
-
-[Quick Start](#quick-start) · [Results](RESULTS.md) · [Whitepaper](docs/whitepaper.md) · [DeepSeek Migration Plan](docs/deepseek_v4_migration.md)
-
-## Core Idea
-
-```text
-tokens
-  -> embeddings
-  -> early Transformer blocks
-  -> PathOracle(hidden-state predictor)
-  -> late Transformer blocks
-  -> logits
-```
-
-Instead of running every middle block during prefill, PathOracle learns to predict the target hidden state at a later anchor layer. The current CPU MVP uses:
-
-- hidden-state pair collection from the original model;
-- MSE loss plus cosine similarity loss;
-- MLP or compact Transformer oracle models;
-- patched inference that runs early blocks, oracle, and late blocks.
-
-## Best Results
-
-| Model | Data | Skip Pattern | Oracle | Params | PPL Ratio | Final Cosine |
-|---|---:|---|---|---:|---:|---:|
-| `distilgpt2` | 5,000 x len128 | run 0-1, skip 2-3, run 4-5 | Transformer, dim 192, 2 blocks | 889K | **1.66x** | **0.9052** |
-| `gpt2` | 5,000 x len64 | run 0-1, skip 2-9, run 10-11 | Transformer, dim 256, 2 blocks | 1.45M | **1.92x** | **0.8871** |
-
-The GPT-2 Small result is the current best checkpoint:
-
-```text
-run_tag = gpt2_wiki5000_len64_tr_sdim256_nb2_cos0.5_e5
-original_ppl = 65.7304
-pathoracle_ppl = 126.2876
-ppl_ratio = 1.92x
-```
-
-See [RESULTS.md](RESULTS.md) for the full experiment history.
-
-## Quick Start
-
-Create an environment and install dependencies:
+- Python ≥ 3.10
+- 虚拟环境（推荐）
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-
-$env:OMP_NUM_THREADS="4"
-$env:MKL_NUM_THREADS="4"
-$env:TOKENIZERS_PARALLELISM="false"
 ```
 
-Run a small smoke test:
+> CPU-only 运行：设置环境变量 `OMP_NUM_THREADS=4`（默认值），各脚本启动时自动读取。
 
-```powershell
-python smoke_test.py --preset distilgpt2
-python collect_data.py --preset distilgpt2 --samples 64 --max-length 64 --clear
-python train_oracle.py --preset distilgpt2 --epochs 1
-python inference_pipeline.py --preset distilgpt2 --max-new-tokens 10
+## 管线概览
+
+五个独立脚本串联成一条数据管线，步骤间通过文件系统传递中间产物：
+
+```
+smoke_test.py  →  collect_data.py  →  train_oracle.py  →  inference_pipeline.py
+                                                              ↓
+                                                         evaluate.py
 ```
 
-Reproduce the stronger GPT-2 Small configuration:
-
-```powershell
-python collect_data.py --preset gpt2 --samples 5000 --max-length 64 --run-tag gpt2_wiki5000_len64_tr_sdim256_nb2_cos0.5_e5 --clear
-
-python train_oracle.py --preset gpt2 --oracle-type transformer --small-dim 256 --num-blocks 2 --cos-weight 0.5 --batch-size 1 --epochs 5 --run-tag gpt2_wiki5000_len64_tr_sdim256_nb2_cos0.5_e5
-
-python evaluate.py --preset gpt2 --run-tag gpt2_wiki5000_len64_tr_sdim256_nb2_cos0.5_e5 --max-texts 20 --max-prompts 5
-```
-
-## Repository Layout
-
-- `config.py`: shared presets and experiment configuration.
-- `collect_data.py`: collects early and target hidden-state pairs.
-- `oracle_model.py`: MLP and Transformer oracle definitions.
-- `train_oracle.py`: oracle training, checkpointing, resume, and fine-tuning.
-- `inference_pipeline.py`: PathOracle inference pipeline.
-- `evaluate.py`: generation and perplexity comparison.
-- `tests/`: unit tests for configuration, oracle construction, and resume behavior.
-- `docs/whitepaper.md`: technical whitepaper draft.
-- `docs/deepseek_v4_migration.md`: DeepSeek-V4 migration design.
-- `docs/deepseek_issue.md`: GitHub proposal draft.
-- `docs/deepseek_email.md`: email proposal draft.
-
-## Design Notes
-
-PathOracle is not intended to replace speculative decoding. It addresses a different phase:
-
-| Method | Phase | Mechanism |
+| 步骤 | 脚本 | 产物 |
 |---|---|---|
-| DSpark / speculative decoding | Decode | Predict candidate future tokens |
-| PathOracle | Prefill | Predict future hidden states and skip blocks |
+| ① 环境验证 | `smoke_test.py` | 打印模型结构和 Oracle 参数量 |
+| ② 采集配对 | `collect_data.py` | `oracle_data_*/pair_*.npz` + `metadata.json` |
+| ③ 训练 Oracle | `train_oracle.py` | `oracle_*.pth`（含权重、配置、历史、优化器状态） |
+| ④ 推理管线 | `inference_pipeline.py` | 生成文本 + PPL |
+| ⑤ 评测 | `evaluate.py` | 生成对比 + WikiText-2 PPL = `eval_results_*.json` |
 
-The two methods can be stacked: PathOracle reduces prefill block execution, then speculative decoding accelerates token-by-token decode.
+## 快速运行（distilgpt2）
 
-## Current Limitations
+```powershell
+# ① 看模型结构和 Oracle 有多少参数
+python smoke_test.py --preset distilgpt2
 
-- The strongest GPT-2 result still shows repeated phrase templates in greedy generation.
-- The project has not yet been validated on a production MoE checkpoint.
-- FLOPs reductions are estimated from skipped block counts and should be remeasured in the target inference runtime.
-- DeepSeek-V4 migration details must be checked against the final target model config before implementation.
+# ② 采集 512 条 hidden-state 配对
+python collect_data.py --preset distilgpt2 --run-tag my_first_run
 
-## License
+# ③ 训练 Oracle（3 个 epoch）
+python train_oracle.py --preset distilgpt2 --run-tag my_first_run --epochs 3
 
-MIT License. See [LICENSE](LICENSE).
+# ④ 用 Oracle 生成文本
+python inference_pipeline.py --preset distilgpt2 --run-tag my_first_run
+
+# ⑤ 评测：对比原始模型 vs PathOracle
+python evaluate.py --preset distilgpt2 --run-tag my_first_run
+```
+
+也提供了封装脚本：
+
+```powershell
+.\run_smoke.ps1                # 端到端冒烟
+.\run_full_distilgpt2.ps1      # 完整 MVP 运行
+```
+
+## 配置
+
+通过 `--preset` 选择预设（`distilgpt2` / `gpt2`），各脚本支持同名参数覆盖默认值。`--run-tag` 自动派生独立的数据目录和检查点路径，多个实验互不干扰。
+
+| 参数 | distilgpt2 默认 | gpt2 默认 |
+|---|---|---|
+| `total_layers` | 6 | 12 |
+| `early_count`（前置层数） | 2 | 2 |
+| `late_count`（后置层数） | 2 | 2 |
+| `target_layer_start` | 4 | 10 |
+| `small_dim`（Oracle 隐层宽度） | 96 | 128 |
+| `oracle_type` | mlp | mlp |
+| `cos_weight` | 0.1 | 0.1 |
+| 默认数据集 | wikitext-2-raw-v1 | wikitext-2-raw-v1 |
+
+### 层跳过模式
+
+```
+distilgpt2 (6 层):   [0][1] → 跳过 [2][3] → [4][5]
+                       ↑ early     Oracle     ↑ late
+
+gpt2 (12 层):        [0][1] → 跳过 [2..9] → [10][11]
+                       ↑ early     Oracle     ↑ late
+```
+
+## 架构
+
+```
+oracle_utils.py        ← 共享工具（embedding、tokenizer 初始化、PPL 计算）
+config.py              ← 配置数据类 + 预设
+oracle_model.py        ← MLP / Transformer Oracle 定义
+collect_data.py        ← 步骤②：提取 (early, target) 配对
+train_oracle.py        ← 步骤③：训练 Oracle（MSE + cosine loss）
+inference_pipeline.py  ← 步骤④：PathOracleGPT2 推理类
+evaluate.py            ← 步骤⑤：生成 + PPL 对比评测
+smoke_test.py          ← 步骤①：环境验证
+```
+
+## 检查点恢复
+
+```powershell
+# 从中断处恢复
+python train_oracle.py --preset distilgpt2 --run-tag myrun --resume
+
+# 从另一个 run_tag 的检查点恢复（微调）
+python train_oracle.py --preset distilgpt2 --run-tag myrun_v2 --resume-from myrun
+
+# 恢复权重但重置优化器
+python train_oracle.py --preset distilgpt2 --run-tag myrun --resume --reset-optimizer
+```
+
+## 测试
+
+```powershell
+python -m pytest tests/ -v
+```
+
+涵盖：配置系统、Oracle 模型构造、检查点恢复逻辑、共享工具函数、配置校验。
+
+## 项目结构
+
+```
+pathoracle_cpu_mvp/
+├── config.py                  # 共享配置
+├── oracle_utils.py            # 共享工具
+├── oracle_model.py            # Oracle 模型
+├── collect_data.py            # 采集配对
+├── train_oracle.py            # 训练
+├── inference_pipeline.py      # 推理管线
+├── evaluate.py                # 评测
+├── smoke_test.py              # 冒烟测试
+├── tests/                     # 单元测试
+├── docs/                      # 白皮书 & 设计文档
+├── pyproject.toml             # 项目元数据
+└── requirements.txt           # 依赖
+```

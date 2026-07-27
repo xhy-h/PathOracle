@@ -1,9 +1,11 @@
-torch
-torchvision
-torchaudio
-transformers
-datasets
-numpy
-tqdm
-safetensors
+# Core ML
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.10.0
 
+# Numeric / IO
+numpy>=1.24.0
+safetensors>=0.3.0
+
+# Progress
+tqdm>=4.60.0

@@ -1,18 +1,28 @@
+"""Step ①: smoke test — validate model shape and estimate oracle parameter count."""
+
 import argparse
+import logging
 
 from transformers import AutoModelForCausalLM
 
 from config import build_experiment_config, validate_model_shape
 from oracle_model import build_oracle, count_parameters
+from oracle_utils import setup_cpu_threads, setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Smoke test / environment validation")
     parser.add_argument("--preset", default="distilgpt2", choices=["distilgpt2", "gpt2"])
     parser.add_argument("--oracle-type", default=None, choices=["mlp", "transformer"])
     parser.add_argument("--small-dim", type=int, default=None)
     parser.add_argument("--num-blocks", type=int, default=None)
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
+
+    setup_cpu_threads()
+    setup_logging(verbose=args.verbose)
 
     cfg = build_experiment_config(
         preset=args.preset,
@@ -26,16 +36,17 @@ def main():
     validate_model_shape(model, cfg)
 
     oracle = build_oracle(oracle_type, cfg.hidden_size, cfg.small_dim, cfg.num_blocks)
-    print(f"model={cfg.model_name}")
-    print(f"layers={len(model.transformer.h)}")
-    print(f"hidden_size={model.config.n_embd}")
-    print(f"early_layers=0..{cfg.early_count - 1}")
-    print(f"skipped_layers={cfg.early_count}..{cfg.target_layer_start - 1}")
-    print(f"late_layers={cfg.target_layer_start}..{cfg.total_layers - 1}")
-    print(f"oracle_type={oracle_type}")
-    print(f"small_dim={cfg.small_dim}")
-    print(f"num_blocks={cfg.num_blocks}")
-    print(f"oracle_parameters={count_parameters(oracle)}")
+
+    logger.info("model=%s", cfg.model_name)
+    logger.info("layers=%d", len(model.transformer.h))
+    logger.info("hidden_size=%d", model.config.n_embd)
+    logger.info("early_layers=0..%d", cfg.early_count - 1)
+    logger.info("skipped_layers=%d..%d", cfg.early_count, cfg.target_layer_start - 1)
+    logger.info("late_layers=%d..%d", cfg.target_layer_start, cfg.total_layers - 1)
+    logger.info("oracle_type=%s", oracle_type)
+    logger.info("small_dim=%d", cfg.small_dim)
+    logger.info("num_blocks=%d", cfg.num_blocks)
+    logger.info("oracle_parameters=%d", count_parameters(oracle))
 
 
 if __name__ == "__main__":

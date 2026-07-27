@@ -1,26 +1,28 @@
 # Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+*.egg-info/
+dist/
+*.egg
 .venv/
 venv/
 
-# Local experiment artifacts
-oracle_data*/
+# Experiment artifacts
+oracle_data_*/
+oracle_*.pth
+oracle_*.json
+
+# Logs
 experiment_logs/
-*.pth
-*.npz
-*.pt
-*.safetensors
+*.out.log
+*.err.log
 
-# Local outputs
-*.log
-*.tmp
-
-# OS / editor
-.DS_Store
-Thumbs.db
-.vscode/
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store

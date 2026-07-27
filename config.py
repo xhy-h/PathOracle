@@ -27,6 +27,9 @@ class ExperimentConfig:
     run_tag: str
     data_dir: str
     checkpoint_path: str
+    # Plan B: Speculative PathOracle
+    confidence_threshold: float = 0.8
+    confidence_coeff: float = 0.1
 
 
 PRESETS = {

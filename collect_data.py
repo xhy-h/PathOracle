@@ -1,26 +1,27 @@
+"""Step ②: extract (early_hidden, target_hidden) pairs from a pretrained model."""
+
 import argparse
 import json
+import logging
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 from config import build_experiment_config, validate_model_shape
+from oracle_utils import embed_inputs, setup_cpu_threads, setup_logging, setup_tokenizer
 
-
-def embed_inputs(model, input_ids):
-    batch_size, seq_len = input_ids.shape
-    position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
-    hidden = model.transformer.wte(input_ids) + model.transformer.wpe(position_ids)
-    return model.transformer.drop(hidden)
+logger = logging.getLogger(__name__)
 
 
 def collect_pair(model, input_ids, cfg):
+    """Run early layers, record hidden state, run skipped layers, record target."""
     hidden = embed_inputs(model, input_ids)
 
     for layer_idx in range(cfg.early_count):
@@ -34,8 +35,16 @@ def collect_pair(model, input_ids, cfg):
     return early.astype(np.float16), target.astype(np.float16)
 
 
+def count_existing_pairs(data_dir: Path) -> int:
+    """Count how many ``pair_*.npz`` files already exist in *data_dir*."""
+    if not data_dir.exists():
+        return 0
+    candidates = [f for f in os.listdir(data_dir) if f.startswith("pair_") and f.endswith(".npz")]
+    return len(candidates)
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Collect hidden-state pairs for oracle training")
     parser.add_argument("--preset", default="distilgpt2", choices=["distilgpt2", "gpt2"])
     parser.add_argument("--samples", type=int, default=None)
     parser.add_argument("--max-length", type=int, default=None)
@@ -46,7 +55,11 @@ def main():
     parser.add_argument("--run-tag", default=None)
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--clear", action="store_true")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
+
+    setup_cpu_threads()
+    setup_logging(verbose=args.verbose)
 
     cfg = build_experiment_config(
         preset=args.preset,
@@ -63,32 +76,46 @@ def main():
     max_length = cfg.max_length
     data_dir = Path(cfg.data_dir)
 
+    # Clear existing data if requested
     if args.clear and data_dir.exists():
+        logger.warning("Clearing existing data directory: %s", data_dir)
         shutil.rmtree(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
+    # Incremental: start from existing count
+    existing = count_existing_pairs(data_dir)
+    if existing > 0:
+        logger.info("Found %d existing pairs, resuming collection", existing)
+
+    # Load model
+    logger.info("Loading model %s ...", cfg.model_name)
+    tokenizer = setup_tokenizer(cfg.model_name)
     model = AutoModelForCausalLM.from_pretrained(cfg.model_name)
     model.eval()
     validate_model_shape(model, cfg)
 
-    if cfg.dataset_config:
-        dataset = load_dataset(
-            cfg.dataset_name,
-            cfg.dataset_config,
-            split=cfg.dataset_split,
-            streaming=cfg.streaming,
-        )
-    else:
-        dataset = load_dataset(
-            cfg.dataset_name,
-            split=cfg.dataset_split,
-            streaming=cfg.streaming,
-        )
+    # Load dataset
+    try:
+        if cfg.dataset_config:
+            dataset = load_dataset(
+                cfg.dataset_name,
+                cfg.dataset_config,
+                split=cfg.dataset_split,
+                streaming=cfg.streaming,
+            )
+        else:
+            dataset = load_dataset(
+                cfg.dataset_name,
+                split=cfg.dataset_split,
+                streaming=cfg.streaming,
+            )
+    except Exception as exc:
+        logger.error("Failed to load dataset '%s' with config '%s': %s",
+                      cfg.dataset_name, cfg.dataset_config, exc)
+        sys.exit(1)
 
-    collected = 0
-    pbar = tqdm(total=samples, desc="collect")
+    collected = existing
+    pbar = tqdm(total=samples, desc="collect", initial=collected)
     with torch.no_grad():
         for item in dataset:
             if collected >= samples:
@@ -131,12 +158,16 @@ def main():
         "dataset_split": cfg.dataset_split,
         "streaming": cfg.streaming,
         "run_tag": cfg.run_tag,
+        "resumed": existing > 0,
     }
-    with open(data_dir / "metadata.json", "w", encoding="utf-8") as f:
+    # Atomic write via temp file
+    meta_tmp = data_dir / "metadata.json.tmp"
+    meta_dst = data_dir / "metadata.json"
+    with open(meta_tmp, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+    meta_tmp.replace(meta_dst)
 
-    print(f"collected={collected}")
-    print(f"data_dir={data_dir}")
+    logger.info("collected=%d  data_dir=%s", collected, data_dir)
 
 
 if __name__ == "__main__":
